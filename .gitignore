@@ -8,6 +8,7 @@ __pycache__/
 
 # Ignore the .env file if it exists
 .env
+.env.example
 # Ignore the media directory if it exists
 media/
 
