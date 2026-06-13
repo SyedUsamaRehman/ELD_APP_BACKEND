@@ -27,7 +27,7 @@ MIDDLEWARE = [
 CORS_ALLOW_ALL_ORIGINS = False
 
 CORS_ALLOWED_ORIGINS = [
-"https://eld-app-frontend.vercel.app/"
+"https://eld-app-frontend.vercel.app"
 ]
 
 ROOT_URLCONF = 'eld_backend.urls'
