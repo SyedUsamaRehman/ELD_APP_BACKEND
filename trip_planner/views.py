@@ -1,6 +1,11 @@
 import json
 import requests
 import math
+import sqlite3
+import time
+import threading
+from pathlib import Path
+from django.conf import settings
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
@@ -11,20 +16,120 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org/route/v1/driving"
 HEADERS = {"User-Agent": "ELD-Trip-Planner/1.0 (assessment-app)"}
 
+# SQLite cache settings
+CACHE_DB_PATH = getattr(settings, 'BASE_DIR', Path(__file__).resolve().parent.parent) / "geocode_cache.db"
+LAST_CALL_TIME = 0.0
+rate_limit_lock = threading.Lock()
 
-def geocode(location: str):
+
+def init_cache_db():
     try:
+        conn = sqlite3.connect(CACHE_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS geocode_cache (
+                query TEXT PRIMARY KEY,
+                lat REAL,
+                lon REAL,
+                created_at REAL
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Failed to initialize geocode cache database: {e}")
+
+
+# Initialize the database cache
+init_cache_db()
+
+
+def get_cached_geocode(query: str):
+    query_clean = query.strip().lower()
+    try:
+        conn = sqlite3.connect(CACHE_DB_PATH, timeout=5)
+        cursor = conn.cursor()
+        cursor.execute("SELECT lat, lon FROM geocode_cache WHERE query = ?", (query_clean,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return float(row[0]), float(row[1])
+    except Exception as e:
+        print(f"Error reading from geocode cache: {e}")
+    return None
+
+
+def set_cached_geocode(query: str, lat: float, lon: float):
+    query_clean = query.strip().lower()
+    try:
+        conn = sqlite3.connect(CACHE_DB_PATH, timeout=5)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO geocode_cache (query, lat, lon, created_at) VALUES (?, ?, ?, ?)",
+            (query_clean, lat, lon, time.time())
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error writing to geocode cache: {e}")
+
+
+def geocode_with_rate_limit(location: str):
+    global LAST_CALL_TIME
+    with rate_limit_lock:
+        elapsed = time.time() - LAST_CALL_TIME
+        if elapsed < 1.0:
+            time.sleep(1.0 - elapsed)
+        
         resp = requests.get(NOMINATIM_URL, params={
             "q": location,
             "format": "json",
             "limit": 1,
         }, headers=HEADERS, timeout=10)
-        data = resp.json()
-        if data:
-            return (float(data[0]["lat"]), float(data[0]["lon"]))
+        
+        LAST_CALL_TIME = time.time()
+    return resp
+
+
+def geocode(location: str):
+    location_clean = location.strip()
+    if not location_clean:
+        return (39.5, -98.35)
+
+    # 1. Try cache first
+    cached = get_cached_geocode(location_clean)
+    if cached is not None:
+        return cached
+
+    # 2. Cache miss -> perform rate-limited request with retry
+    try:
+        resp = None
+        for attempt in range(2):
+            resp = geocode_with_rate_limit(location_clean)
+            if resp.status_code == 200:
+                break
+            # If rate limited (e.g. 429, 403), sleep a bit extra and retry
+            if resp.status_code in (429, 403):
+                time.sleep(2.0)
+            else:
+                break
+
+        if resp and resp.status_code == 200:
+            if "application/json" in resp.headers.get("Content-Type", ""):
+                data = resp.json()
+                if data:
+                    lat, lon = float(data[0]["lat"]), float(data[0]["lon"])
+                    set_cached_geocode(location_clean, lat, lon)
+                    return (lat, lon)
+            else:
+                print(f"Nominatim returned non-JSON content: {resp.text[:200]}")
+        elif resp:
+            print(f"Geocode API error for {location_clean}: Status {resp.status_code}, Response: {resp.text[:200]}")
     except Exception as e:
-        print(f"Geocode error for {location}: {e}")
+        print(f"Geocode exception for {location_clean}: {e}")
+
     return (39.5, -98.35)
+
 
 
 def get_route(origin_coords, dest_coords):
